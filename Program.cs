@@ -185,7 +185,7 @@ internal static class NexusComponentCounterApp
 
                 componentCount += response.Items.Length;
                 Console.WriteLine(
-                    $"Found {componentCount} components so far in {repository.Name}     (Completed repos: {getCompletedCount()}/{totalRepositories})"
+                    $"Found {componentCount} components ... in {repository.Name}     (Completed repos: {getCompletedCount()}/{totalRepositories})"
                 );
 
                 continuationToken = string.IsNullOrWhiteSpace(response.ContinuationToken)
