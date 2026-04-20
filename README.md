@@ -112,18 +112,33 @@ hosted_nuget_components.json
 The JSON output is sorted by component count in descending order:
 
 ```json
-{
-  "repo-a": {
-    "type": "hosted",
-    "format": "nuget",
-    "count": 1200
+[
+  {
+    "RepoName": "maven-public",
+    "Type": "group",
+    "Format": "maven2",
+    "Count": 28194
   },
-  "repo-b": {
-    "type": "proxy",
-    "format": "npm",
-    "count": 450
-  }
-}
+  {
+    "RepoName": "maven-central",
+    "Type": "proxy",
+    "Format": "maven2",
+    "Count": 15823
+  },
+  {
+    "RepoName": "nuget-group",
+    "Type": "group",
+    "Format": "nuget",
+    "Count": 10213
+  },
+  {
+    "RepoName": "nuget-hosted",
+    "Type": "hosted",
+    "Format": "nuget",
+    "Count": 7967
+  },
+  ....
+]
 ```
 
 ## Notes
