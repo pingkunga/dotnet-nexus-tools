@@ -94,6 +94,45 @@ Write output to a specific folder and limit concurrency:
 .\tools\nexus-component-counter.exe --url https://nexus.example.com/service/rest/v1 --concurrency 5 --output-dir .\out
 ```
 
+### List components
+
+List components in a single repository (default: writes `\<repository\>_components.json` to current directory):
+
+```powershell
+dotnet run -- list-components --url https://nexus.example.com/service/rest/v1 --repository maven-public
+# writes ./maven-public_components.json
+```
+
+Write list output to a specific folder:
+
+```powershell
+dotnet run -- list-components --url https://nexus.example.com/service/rest/v1 --repository maven-public --output-dir .\out
+# writes .\out\maven-public_components.json
+```
+
+Write list output to a specific file:
+
+```powershell
+dotnet run -- list-components --url https://nexus.example.com/service/rest/v1 --repository maven-public --output maven_components.json
+# writes ./maven_components.json
+```
+
+### List assets
+
+List assets in a single repository (default: writes `\<repository\>_assets.json` to current directory):
+
+```powershell
+dotnet run -- list-assets --url https://nexus.example.com/service/rest/v1 --repository maven-public
+# writes ./maven-public_assets.json
+```
+
+Write list assets to a specific file:
+
+```powershell
+dotnet run -- list-assets --url https://nexus.example.com/service/rest/v1 --repository maven-public --output assets.json
+# writes ./assets.json
+```
+
 ## Output
 
 The output file name follows this pattern:
