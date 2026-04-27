@@ -21,6 +21,14 @@ internal static class NexusComponentCounterApp
             return parseResult.ExitCode;
         }
 
+        if (parseResult.ShowVersion)
+        {
+            var version =
+                typeof(NexusComponentCounterApp).Assembly.GetName().Version?.ToString() ?? "1.0.0";
+            Console.WriteLine(version);
+            return 0;
+        }
+
         if (parseResult.ErrorMessage is not null)
         {
             Console.Error.WriteLine(parseResult.ErrorMessage);
@@ -698,6 +706,7 @@ internal sealed record NexusAssetResponse(
 internal sealed record ParsedOptions(
     CommandLineOptions? Options,
     bool ShowHelp,
+    bool ShowVersion,
     string? ErrorMessage,
     int ExitCode = 0
 );
@@ -720,6 +729,7 @@ internal sealed class CommandLineOptions
         Common options:
           --url             Required. Base URL for the Nexus REST API.
           -h, --help        Show this help message.
+          -v, --version     Show version information.
 
         Count options:
           --type            Optional. Filter repositories by type.
@@ -769,7 +779,7 @@ internal sealed class CommandLineOptions
     {
         if (args.Length == 0)
         {
-            return new ParsedOptions(null, true, null);
+            return new ParsedOptions(null, true, false, null);
         }
 
         var command = CommandType.Count;
@@ -792,7 +802,7 @@ internal sealed class CommandLineOptions
                     startIndex = 1;
                     break;
                 default:
-                    return new ParsedOptions(null, false, $"Unrecognized command '{args[0]}'.");
+                    return new ParsedOptions(null, false, false, $"Unrecognized command '{args[0]}'.");
             }
         }
 
@@ -813,12 +823,17 @@ internal sealed class CommandLineOptions
 
             if (argument is "-h" or "--help")
             {
-                return new ParsedOptions(null, true, null);
+                return new ParsedOptions(null, true, false, null);
+            }
+
+            if (argument is "-v" or "--version")
+            {
+                return new ParsedOptions(null, false, true, null);
             }
 
             if (!TrySplitArgument(argument, out var optionName, out var inlineValue))
             {
-                return new ParsedOptions(null, false, $"Unrecognized argument '{argument}'.");
+                return new ParsedOptions(null, false, false, $"Unrecognized argument '{argument}'.");
             }
 
             string? optionValue = inlineValue;
@@ -827,7 +842,7 @@ internal sealed class CommandLineOptions
             {
                 if (index + 1 >= args.Length)
                 {
-                    return new ParsedOptions(null, false, $"Missing value for '{optionName}'.");
+                    return new ParsedOptions(null, false, false, $"Missing value for '{optionName}'.");
                 }
 
                 optionValue = args[++index];
@@ -850,6 +865,7 @@ internal sealed class CommandLineOptions
                         return new ParsedOptions(
                             null,
                             false,
+                            false,
                             "Concurrency must be a positive integer."
                         );
                     }
@@ -867,6 +883,7 @@ internal sealed class CommandLineOptions
                         return new ParsedOptions(
                             null,
                             false,
+                            false,
                             $"Unsupported sort field '{optionValue}'."
                         );
                     }
@@ -877,6 +894,7 @@ internal sealed class CommandLineOptions
                     {
                         return new ParsedOptions(
                             null,
+                            false,
                             false,
                             $"Unsupported sort order '{optionValue}'."
                         );
@@ -889,6 +907,7 @@ internal sealed class CommandLineOptions
                         return new ParsedOptions(
                             null,
                             false,
+                            false,
                             "Limit must be a positive integer."
                         );
                     }
@@ -899,13 +918,18 @@ internal sealed class CommandLineOptions
                     outputPath = optionValue;
                     break;
                 default:
-                    return new ParsedOptions(null, false, $"Unrecognized argument '{optionName}'.");
+                    return new ParsedOptions(
+                        null,
+                        false,
+                        false,
+                        $"Unrecognized argument '{optionName}'."
+                    );
             }
         }
 
         if (string.IsNullOrWhiteSpace(url))
         {
-            return new ParsedOptions(null, false, "The --url option is required.");
+            return new ParsedOptions(null, false, false, "The --url option is required.");
         }
 
         if (
@@ -913,7 +937,7 @@ internal sealed class CommandLineOptions
             && string.IsNullOrWhiteSpace(repository)
         )
         {
-            return new ParsedOptions(null, false, "The --repository option is required.");
+            return new ParsedOptions(null, false, false, "The --repository option is required.");
         }
 
         return new ParsedOptions(
@@ -935,6 +959,7 @@ internal sealed class CommandLineOptions
                 Limit = limit,
                 OutputPath = string.IsNullOrWhiteSpace(outputPath) ? null : outputPath
             },
+            false,
             false,
             null
         );
