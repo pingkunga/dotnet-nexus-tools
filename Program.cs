@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -42,30 +42,73 @@ internal static class NexusComponentCounterApp
         }
 
         var baseUrl = options.Url.TrimEnd('/');
-        Directory.CreateDirectory(options.OutputDirectory);
-
-        var outputFileName =
-            $"{options.RepositoryType ?? "RepoTypeAll"}_{options.RepositoryFormat ?? "FormatAll"}_components.json";
-        var outputPath = Path.Combine(options.OutputDirectory, outputFileName);
 
         using var httpClient = CreateHttpClient(username, password);
+
+        return options.Command switch
+        {
+            CommandType.Count => await RunCountAsync(baseUrl, httpClient, options, CancellationToken.None),
+            CommandType.ListComponents => await RunListComponentsAsync(
+                baseUrl,
+                httpClient,
+                options,
+                CancellationToken.None
+            ),
+            CommandType.ListAssets => await RunListAssetsAsync(
+                baseUrl,
+                httpClient,
+                options,
+                CancellationToken.None
+            ),
+            _ => throw new InvalidOperationException($"Unsupported command '{options.Command}'.")
+        };
+    }
+
+    private static async Task<int> RunCountAsync(
+        string baseUrl,
+        HttpClient httpClient,
+        CommandLineOptions options,
+        CancellationToken cancellationToken
+    )
+    {
+        string outputPath;
+
+        if (!string.IsNullOrWhiteSpace(options.OutputPath))
+        {
+            var outputDir = Path.GetDirectoryName(options.OutputPath);
+            if (!string.IsNullOrWhiteSpace(outputDir))
+            {
+                Directory.CreateDirectory(outputDir);
+            }
+
+            outputPath = options.OutputPath;
+        }
+        else
+        {
+            var dir = options.OutputDirectory ?? Directory.GetCurrentDirectory();
+            Directory.CreateDirectory(dir);
+
+            var outputFileName =
+                $"{options.RepositoryType ?? "RepoTypeAll"}_{options.RepositoryFormat ?? "FormatAll"}_components.json";
+            outputPath = Path.Combine(dir, outputFileName);
+        }
 
         var repositories = await GetRepositoriesAsync(
             baseUrl,
             httpClient,
             options.RepositoryType,
             options.RepositoryFormat,
-            CancellationToken.None
+            cancellationToken
         );
 
         Console.WriteLine($"Total repositories fetched: {repositories.Count}");
 
         if (repositories.Count == 0)
         {
-            await WriteResultsFileAsync(
+            await WriteRepositoryCountResultsFileAsync(
                 outputPath,
                 new Dictionary<string, RepositoryCountResult>(StringComparer.OrdinalIgnoreCase),
-                CancellationToken.None
+                cancellationToken
             );
 
             return 0;
@@ -91,11 +134,77 @@ internal static class NexusComponentCounterApp
                     repositories.Count,
                     () => Volatile.Read(ref completedRepositories),
                     () => Interlocked.Increment(ref completedRepositories),
-                    CancellationToken.None
+                    cancellationToken
                 )
         );
 
         await Task.WhenAll(tasks);
+        return 0;
+    }
+
+    private static async Task<int> RunListComponentsAsync(
+        string baseUrl,
+        HttpClient httpClient,
+        CommandLineOptions options,
+        CancellationToken cancellationToken
+    )
+    {
+        var components = await GetAllPagesAsync<ComponentResponse>(
+            continuationToken => BuildComponentsUrl(baseUrl, options.Repository!, continuationToken),
+            httpClient,
+            cancellationToken
+        );
+
+        var results = components
+            .Select(CreateListComponentResult)
+            .ToList();
+
+        var orderedResults = SortComponentResults(results, options.SortBy, options.SortOrder);
+        var limitedResults = ApplyLimit(orderedResults, options.Limit);
+
+        var listOutputPath = options.OutputPath;
+        if (string.IsNullOrWhiteSpace(listOutputPath))
+        {
+            var dir = options.OutputDirectory ?? Directory.GetCurrentDirectory();
+            Directory.CreateDirectory(dir);
+            var fileName = $"{options.Repository}_components.json";
+            listOutputPath = Path.Combine(dir, fileName);
+        }
+
+        await WriteJsonOutputAsync(listOutputPath, limitedResults, cancellationToken);
+        return 0;
+    }
+
+    private static async Task<int> RunListAssetsAsync(
+        string baseUrl,
+        HttpClient httpClient,
+        CommandLineOptions options,
+        CancellationToken cancellationToken
+    )
+    {
+        var assets = await GetAllPagesAsync<NexusAssetResponse>(
+            continuationToken => BuildAssetsUrl(baseUrl, options.Repository!, continuationToken),
+            httpClient,
+            cancellationToken
+        );
+
+        var results = assets
+            .Select(CreateListAssetResult)
+            .ToList();
+
+        var orderedResults = SortAssetResults(results, options.SortBy, options.SortOrder);
+        var limitedResults = ApplyLimit(orderedResults, options.Limit);
+
+        var listOutputPath = options.OutputPath;
+        if (string.IsNullOrWhiteSpace(listOutputPath))
+        {
+            var dir = options.OutputDirectory ?? Directory.GetCurrentDirectory();
+            Directory.CreateDirectory(dir);
+            var fileName = $"{options.Repository}_assets.json";
+            listOutputPath = Path.Combine(dir, fileName);
+        }
+
+        await WriteJsonOutputAsync(listOutputPath, limitedResults, cancellationToken);
         return 0;
     }
 
@@ -177,7 +286,7 @@ internal static class NexusComponentCounterApp
             do
             {
                 var requestUrl = BuildComponentsUrl(baseUrl, repository.Name, continuationToken);
-                var response = await GetFromJsonAsync<ComponentPageResponse>(
+                var response = await GetFromJsonAsync<PagedResponse<ComponentResponse>>(
                     httpClient,
                     requestUrl,
                     cancellationToken
@@ -216,7 +325,11 @@ internal static class NexusComponentCounterApp
                     StringComparer.OrdinalIgnoreCase
                 );
 
-            await WriteResultsFileAsync(outputPath, orderedResults, cancellationToken);
+            await WriteRepositoryCountResultsFileAsync(
+                outputPath,
+                orderedResults,
+                cancellationToken
+            );
         }
         finally
         {
@@ -225,6 +338,32 @@ internal static class NexusComponentCounterApp
 
         var completed = incrementCompletedCount();
         Console.WriteLine($"Completed {completed}/{totalRepositories}: {repository.Name}");
+    }
+
+    private static async Task<IReadOnlyList<TItem>> GetAllPagesAsync<TItem>(
+        Func<string?, string> buildUrl,
+        HttpClient httpClient,
+        CancellationToken cancellationToken
+    )
+    {
+        var results = new List<TItem>();
+        string? continuationToken = null;
+
+        do
+        {
+            var response = await GetFromJsonAsync<PagedResponse<TItem>>(
+                httpClient,
+                buildUrl(continuationToken),
+                cancellationToken
+            );
+
+            results.AddRange(response.Items);
+            continuationToken = string.IsNullOrWhiteSpace(response.ContinuationToken)
+                ? null
+                : response.ContinuationToken;
+        } while (continuationToken is not null);
+
+        return results;
     }
 
     private static async Task<T> GetFromJsonAsync<T>(
@@ -249,13 +388,139 @@ internal static class NexusComponentCounterApp
             );
     }
 
-    private static async Task WriteResultsFileAsync(
+    private static ListComponentResult CreateListComponentResult(ComponentResponse component)
+    {
+        var assets = component.Assets ?? Array.Empty<NexusAssetResponse>();
+        var createdCandidates = assets
+            .Select(GetAssetAgeTimestamp)
+            .Where(timestamp => timestamp.HasValue)
+            .Select(timestamp => timestamp!.Value)
+            .ToArray();
+        var modifiedCandidates = assets
+            .Where(asset => asset.LastModified.HasValue)
+            .Select(asset => asset.LastModified!.Value)
+            .ToArray();
+        var downloadedCandidates = assets
+            .Where(asset => asset.LastDownloaded.HasValue)
+            .Select(asset => asset.LastDownloaded!.Value)
+            .ToArray();
+
+        return new ListComponentResult(
+            component.Repository,
+            component.Format,
+            component.Group,
+            component.Name,
+            component.Version,
+            assets.Length,
+            createdCandidates.Length == 0 ? null : createdCandidates.Min(),
+            modifiedCandidates.Length == 0 ? null : modifiedCandidates.Max(),
+            downloadedCandidates.Length == 0 ? null : downloadedCandidates.Max()
+        );
+    }
+
+    private static ListAssetResult CreateListAssetResult(NexusAssetResponse asset) =>
+        new(
+            asset.Repository,
+            asset.Format,
+            asset.Path,
+            asset.DownloadUrl,
+            asset.Id,
+            asset.FileSize,
+            GetAssetAgeTimestamp(asset),
+            asset.LastModified,
+            asset.LastDownloaded
+        );
+
+    private static DateTimeOffset? GetAssetAgeTimestamp(NexusAssetResponse asset) =>
+        asset.BlobCreated ?? asset.LastModified;
+
+    private static IReadOnlyList<ListComponentResult> SortComponentResults(
+        IEnumerable<ListComponentResult> results,
+        SortField sortBy,
+        SortDirection sortOrder
+    ) =>
+        sortBy switch
+        {
+            SortField.Age => sortOrder == SortDirection.Desc
+                ? results
+                    .OrderBy(result => result.AgeTimestamp is null)
+                    .ThenBy(result => result.AgeTimestamp)
+                    .ThenBy(result => result.Name, StringComparer.OrdinalIgnoreCase)
+                    .ToArray()
+                : results
+                    .OrderBy(result => result.AgeTimestamp is null)
+                    .ThenByDescending(result => result.AgeTimestamp)
+                    .ThenBy(result => result.Name, StringComparer.OrdinalIgnoreCase)
+                    .ToArray(),
+            SortField.LastDownloaded => ApplySort(
+                results,
+                result => result.LastDownloaded,
+                sortOrder
+            ),
+            SortField.LastModified => ApplySort(
+                results,
+                result => result.LastModified,
+                sortOrder
+            ),
+            SortField.Version => ApplySort(
+                results,
+                result => result.Version ?? string.Empty,
+                sortOrder
+            ),
+            _ => ApplySort(results, result => result.Name ?? string.Empty, sortOrder)
+        };
+
+    private static IReadOnlyList<ListAssetResult> SortAssetResults(
+        IEnumerable<ListAssetResult> results,
+        SortField sortBy,
+        SortDirection sortOrder
+    ) =>
+        sortBy switch
+        {
+            SortField.Age => sortOrder == SortDirection.Desc
+                ? results
+                    .OrderBy(result => result.AgeTimestamp is null)
+                    .ThenBy(result => result.AgeTimestamp)
+                    .ThenBy(result => result.Path, StringComparer.OrdinalIgnoreCase)
+                    .ToArray()
+                : results
+                    .OrderBy(result => result.AgeTimestamp is null)
+                    .ThenByDescending(result => result.AgeTimestamp)
+                    .ThenBy(result => result.Path, StringComparer.OrdinalIgnoreCase)
+                    .ToArray(),
+            SortField.LastDownloaded => ApplySort(
+                results,
+                result => result.LastDownloaded,
+                sortOrder
+            ),
+            SortField.LastModified => ApplySort(
+                results,
+                result => result.LastModified,
+                sortOrder
+            ),
+            SortField.Version => ApplySort(results, result => result.Path, sortOrder),
+            _ => ApplySort(results, result => result.Path, sortOrder)
+        };
+
+    private static IReadOnlyList<T> ApplySort<T, TKey>(
+        IEnumerable<T> results,
+        Func<T, TKey> selector,
+        SortDirection sortOrder
+    )
+        where TKey : notnull =>
+        sortOrder == SortDirection.Asc
+            ? results.OrderBy(selector).ToArray()
+            : results.OrderByDescending(selector).ToArray();
+
+    private static IReadOnlyList<T> ApplyLimit<T>(IReadOnlyList<T> results, int? limit) =>
+        limit is null ? results : results.Take(limit.Value).ToArray();
+
+    private static async Task WriteRepositoryCountResultsFileAsync(
         string outputPath,
         IDictionary<string, RepositoryCountResult> results,
         CancellationToken cancellationToken
     )
     {
-        // Convert dictionary to an array of objects with RepoName property
         var arrayResults = results
             .Select(
                 kvp =>
@@ -273,6 +538,34 @@ internal static class NexusComponentCounterApp
         await JsonSerializer.SerializeAsync(
             outputStream,
             arrayResults,
+            JsonOptions,
+            cancellationToken
+        );
+    }
+
+    private static async Task WriteJsonOutputAsync<T>(
+        string? outputPath,
+        IReadOnlyList<T> results,
+        CancellationToken cancellationToken
+    )
+    {
+        if (string.IsNullOrWhiteSpace(outputPath))
+        {
+            Console.WriteLine(JsonSerializer.Serialize(results, JsonOptions));
+            return;
+        }
+
+        var directory = Path.GetDirectoryName(outputPath);
+
+        if (!string.IsNullOrWhiteSpace(directory))
+        {
+            Directory.CreateDirectory(directory);
+        }
+
+        await using var outputStream = File.Create(outputPath);
+        await JsonSerializer.SerializeAsync(
+            outputStream,
+            results,
             JsonOptions,
             cancellationToken
         );
@@ -296,11 +589,76 @@ internal static class NexusComponentCounterApp
 
         return builder.ToString();
     }
+
+    private static string BuildAssetsUrl(
+        string baseUrl,
+        string repositoryName,
+        string? continuationToken
+    )
+    {
+        var builder = new StringBuilder(
+            $"{baseUrl}/assets?repository={Uri.EscapeDataString(repositoryName)}"
+        );
+
+        if (!string.IsNullOrWhiteSpace(continuationToken))
+        {
+            builder.Append("&continuationToken=");
+            builder.Append(Uri.EscapeDataString(continuationToken));
+        }
+
+        return builder.ToString();
+    }
+}
+
+internal enum CommandType
+{
+    Count,
+    ListComponents,
+    ListAssets
+}
+
+internal enum SortField
+{
+    Name,
+    Version,
+    Age,
+    LastModified,
+    LastDownloaded
+}
+
+internal enum SortDirection
+{
+    Asc,
+    Desc
 }
 
 internal sealed record RepositoryInfo(string Name, string Type, string Format);
 
 internal sealed record RepositoryCountResult(string Type, string Format, int Count);
+
+internal sealed record ListComponentResult(
+    string Repository,
+    string Format,
+    string? Group,
+    string Name,
+    string? Version,
+    int AssetCount,
+    DateTimeOffset? AgeTimestamp,
+    DateTimeOffset? LastModified,
+    DateTimeOffset? LastDownloaded
+);
+
+internal sealed record ListAssetResult(
+    string Repository,
+    string Format,
+    string Path,
+    string DownloadUrl,
+    string Id,
+    long? FileSize,
+    DateTimeOffset? AgeTimestamp,
+    DateTimeOffset? LastModified,
+    DateTimeOffset? LastDownloaded
+);
 
 internal sealed record RepositoryResponse(
     [property: JsonPropertyName("name")] string Name,
@@ -308,9 +666,31 @@ internal sealed record RepositoryResponse(
     [property: JsonPropertyName("format")] string Format
 );
 
-internal sealed record ComponentPageResponse(
-    [property: JsonPropertyName("items")] JsonElement[] Items,
+internal sealed record PagedResponse<T>(
+    [property: JsonPropertyName("items")] T[] Items,
     [property: JsonPropertyName("continuationToken")] string? ContinuationToken
+);
+
+internal sealed record ComponentResponse(
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("repository")] string Repository,
+    [property: JsonPropertyName("format")] string Format,
+    [property: JsonPropertyName("group")] string? Group,
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("version")] string? Version,
+    [property: JsonPropertyName("assets")] NexusAssetResponse[]? Assets
+);
+
+internal sealed record NexusAssetResponse(
+    [property: JsonPropertyName("downloadUrl")] string DownloadUrl,
+    [property: JsonPropertyName("path")] string Path,
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("repository")] string Repository,
+    [property: JsonPropertyName("format")] string Format,
+    [property: JsonPropertyName("fileSize")] long? FileSize,
+    [property: JsonPropertyName("lastModified")] DateTimeOffset? LastModified,
+    [property: JsonPropertyName("lastDownloaded")] DateTimeOffset? LastDownloaded,
+    [property: JsonPropertyName("blobCreated")] DateTimeOffset? BlobCreated
 );
 
 internal sealed record ParsedOptions(
@@ -326,19 +706,42 @@ internal sealed class CommandLineOptions
         """
         Usage:
           nexus-component-counter --url <nexus-api-url> [--type <repo-type>] [--format <repo-format>] [--concurrency <count>] [--output-dir <directory>]
+          nexus-component-counter count --url <nexus-api-url> [--type <repo-type>] [--format <repo-format>] [--concurrency <count>] [--output-dir <directory>]
+          nexus-component-counter list-components --url <nexus-api-url> --repository <repo-name> [--sort-by <name|version|age|last-modified|last-downloaded>] [--order <asc|desc>] [--limit <count>] [--output <file>]
+          nexus-component-counter list-assets --url <nexus-api-url> --repository <repo-name> [--sort-by <name|version|age|last-modified|last-downloaded>] [--order <asc|desc>] [--limit <count>] [--output <file>]
 
-        Options:
-          --url            Required. Base URL for the Nexus REST API.
-          --type           Optional. Filter repositories by type.
-          --format         Optional. Filter repositories by format.
-          --concurrency    Optional. Maximum number of repositories processed concurrently. Default: 10.
-          --output-dir     Optional. Directory for the JSON results file. Default: current directory.
-          -h, --help       Show this help message.
+        Commands:
+          count             Count components per repository. The bare command without a subcommand behaves the same way.
+          list-components   List components in a repository and sort the results client-side.
+          list-assets       List assets in a repository and sort the results client-side.
+
+        Common options:
+          --url             Required. Base URL for the Nexus REST API.
+          -h, --help        Show this help message.
+
+        Count options:
+          --type            Optional. Filter repositories by type.
+          --format          Optional. Filter repositories by format.
+          --concurrency     Optional. Maximum number of repositories processed concurrently. Default: 10.
+          --output-dir      Optional. Directory for the JSON results file. Default: current directory.
+
+        List options:
+          --repository      Required. Repository name to inspect.
+          --sort-by         Optional. Sort key. Default: name.
+          --order           Optional. Sort order. Default: desc.
+          --limit           Optional. Maximum number of rows to return after sorting.
+          --output          Optional. File path for JSON output. If omitted, JSON is written to stdout.
+
+        Notes:
+          age sorting uses blobCreated when available and falls back to lastModified.
+          list-components derives age from the earliest asset timestamp and last-downloaded/last-modified from the most recent asset timestamp.
 
         Environment:
-          NEXUS_USERNAME   Nexus username for HTTP basic auth.
-          NEXUS_PASSWORD   Nexus password for HTTP basic auth.
+          NEXUS_USERNAME    Nexus username for HTTP basic auth.
+          NEXUS_PASSWORD    Nexus password for HTTP basic auth.
         """;
+
+    public required CommandType Command { get; init; }
 
     public required string Url { get; init; }
 
@@ -350,6 +753,16 @@ internal sealed class CommandLineOptions
 
     public string OutputDirectory { get; init; } = Directory.GetCurrentDirectory();
 
+    public string? Repository { get; init; }
+
+    public SortField SortBy { get; init; } = SortField.Name;
+
+    public SortDirection SortOrder { get; init; } = SortDirection.Desc;
+
+    public int? Limit { get; init; }
+
+    public string? OutputPath { get; init; }
+
     public static ParsedOptions Parse(string[] args)
     {
         if (args.Length == 0)
@@ -357,13 +770,42 @@ internal sealed class CommandLineOptions
             return new ParsedOptions(null, true, null);
         }
 
+        var command = CommandType.Count;
+        var startIndex = 0;
+
+        if (!args[0].StartsWith("-", StringComparison.Ordinal))
+        {
+            switch (args[0])
+            {
+                case "count":
+                    command = CommandType.Count;
+                    startIndex = 1;
+                    break;
+                case "list-components":
+                    command = CommandType.ListComponents;
+                    startIndex = 1;
+                    break;
+                case "list-assets":
+                    command = CommandType.ListAssets;
+                    startIndex = 1;
+                    break;
+                default:
+                    return new ParsedOptions(null, false, $"Unrecognized command '{args[0]}'.");
+            }
+        }
+
         string? url = null;
         string? repositoryType = null;
         string? repositoryFormat = null;
         var concurrency = 10;
         string? outputDirectory = null;
+        string? repository = null;
+        var sortBy = SortField.Name;
+        var sortOrder = SortDirection.Desc;
+        int? limit = null;
+        string? outputPath = null;
 
-        for (var index = 0; index < args.Length; index++)
+        for (var index = startIndex; index < args.Length; index++)
         {
             var argument = args[index];
 
@@ -414,6 +856,46 @@ internal sealed class CommandLineOptions
                 case "--output-dir":
                     outputDirectory = optionValue;
                     break;
+                case "--repository":
+                    repository = optionValue;
+                    break;
+                case "--sort-by":
+                    if (!TryParseSortField(optionValue, out sortBy))
+                    {
+                        return new ParsedOptions(
+                            null,
+                            false,
+                            $"Unsupported sort field '{optionValue}'."
+                        );
+                    }
+
+                    break;
+                case "--order":
+                    if (!TryParseSortDirection(optionValue, out sortOrder))
+                    {
+                        return new ParsedOptions(
+                            null,
+                            false,
+                            $"Unsupported sort order '{optionValue}'."
+                        );
+                    }
+
+                    break;
+                case "--limit":
+                    if (!int.TryParse(optionValue, out var parsedLimit) || parsedLimit <= 0)
+                    {
+                        return new ParsedOptions(
+                            null,
+                            false,
+                            "Limit must be a positive integer."
+                        );
+                    }
+
+                    limit = parsedLimit;
+                    break;
+                case "--output":
+                    outputPath = optionValue;
+                    break;
                 default:
                     return new ParsedOptions(null, false, $"Unrecognized argument '{optionName}'.");
             }
@@ -424,9 +906,18 @@ internal sealed class CommandLineOptions
             return new ParsedOptions(null, false, "The --url option is required.");
         }
 
+        if (
+            command is CommandType.ListComponents or CommandType.ListAssets
+            && string.IsNullOrWhiteSpace(repository)
+        )
+        {
+            return new ParsedOptions(null, false, "The --repository option is required.");
+        }
+
         return new ParsedOptions(
             new CommandLineOptions
             {
+                Command = command,
                 Url = url,
                 RepositoryType = string.IsNullOrWhiteSpace(repositoryType) ? null : repositoryType,
                 RepositoryFormat = string.IsNullOrWhiteSpace(repositoryFormat)
@@ -435,11 +926,43 @@ internal sealed class CommandLineOptions
                 Concurrency = concurrency,
                 OutputDirectory = string.IsNullOrWhiteSpace(outputDirectory)
                     ? Directory.GetCurrentDirectory()
-                    : outputDirectory
+                    : outputDirectory,
+                Repository = string.IsNullOrWhiteSpace(repository) ? null : repository,
+                SortBy = sortBy,
+                SortOrder = sortOrder,
+                Limit = limit,
+                OutputPath = string.IsNullOrWhiteSpace(outputPath) ? null : outputPath
             },
             false,
             null
         );
+    }
+
+    private static bool TryParseSortField(string value, out SortField sortField)
+    {
+        sortField = value.ToLowerInvariant() switch
+        {
+            "name" => SortField.Name,
+            "version" => SortField.Version,
+            "age" => SortField.Age,
+            "last-modified" => SortField.LastModified,
+            "last-downloaded" => SortField.LastDownloaded,
+            _ => default
+        };
+
+        return value is "name" or "version" or "age" or "last-modified" or "last-downloaded";
+    }
+
+    private static bool TryParseSortDirection(string value, out SortDirection direction)
+    {
+        direction = value.ToLowerInvariant() switch
+        {
+            "asc" => SortDirection.Asc,
+            "desc" => SortDirection.Desc,
+            _ => default
+        };
+
+        return value is "asc" or "desc";
     }
 
     private static bool TrySplitArgument(
