@@ -16,13 +16,19 @@ A .NET 10 command-line tool that counts components in Sonatype Nexus repositorie
 - Access to a Nexus instance with the REST API enabled
 - `NEXUS_USERNAME` and `NEXUS_PASSWORD` environment variables
 
-## Build
+## Release & Installation
+
+This project uses GitHub Actions to automatically create releases. When a new tag (e.g., `v1.0.0`) is pushed, a release is created with:
+- **Standalone Binaries**: Self-contained executables for Windows, Linux, and macOS (Intel/ARM). No .NET installation is required to run these.
+- **NuGet Package**: A `.nupkg` file for installation as a .NET Tool.
+
+### Manual Build
 
 ```powershell
 dotnet build
 ```
 
-## Pack as a .NET Tool
+### Pack as a .NET Tool
 
 ```powershell
 dotnet pack -c Release
