@@ -68,8 +68,125 @@ internal static class NexusComponentCounterApp
                 options,
                 CancellationToken.None
             ),
+            CommandType.DeleteComponents => await RunDeleteComponentsAsync(
+                baseUrl,
+                httpClient,
+                options,
+                CancellationToken.None
+            ),
             _ => throw new InvalidOperationException($"Unsupported command '{options.Command}'.")
         };
+    }
+
+    private static async Task<int> RunDeleteComponentsAsync(
+        string baseUrl,
+        HttpClient httpClient,
+        CommandLineOptions options,
+        CancellationToken cancellationToken
+    )
+    {
+        if (string.IsNullOrWhiteSpace(options.InputPath) || !File.Exists(options.InputPath))
+        {
+            Console.Error.WriteLine($"Input file not found: {options.InputPath}");
+            return 1;
+        }
+
+        List<ListComponentResult>? componentsToDelete;
+        try
+        {
+            var json = await File.ReadAllTextAsync(options.InputPath, cancellationToken);
+            componentsToDelete = JsonSerializer.Deserialize<List<ListComponentResult>>(json, JsonOptions);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Failed to parse input file: {ex.Message}");
+            return 1;
+        }
+
+        if (componentsToDelete == null || componentsToDelete.Count == 0)
+        {
+            Console.WriteLine("No components found in input file to delete.");
+            return 0;
+        }
+
+        if (!options.Force)
+        {
+            Console.WriteLine("--- DRY RUN MODE --- (Use --force to actually delete)");
+            foreach (var component in componentsToDelete)
+            {
+                Console.WriteLine($"[Dry-Run] Would delete: {component.Repository} | {component.Group ?? "no-group"} | {component.Name} | {component.Version} (ID: {component.Id})");
+            }
+            Console.WriteLine($"--- Total components to delete: {componentsToDelete.Count} ---");
+            Console.WriteLine("Reminder: Add --force flag to execute deletion.");
+            return 0;
+        }
+
+        Console.WriteLine($"Starting bulk deletion of {componentsToDelete.Count} components with concurrency {options.Concurrency}...");
+
+        var concurrencyLimiter = new SemaphoreSlim(options.Concurrency);
+        var successCount = 0;
+        var failureCount = 0;
+        var consecutiveErrors = 0;
+        var total = componentsToDelete.Count;
+
+        var tasks = componentsToDelete.Select(async (component, index) =>
+        {
+            await concurrencyLimiter.WaitAsync(cancellationToken);
+            try
+            {
+                if (Volatile.Read(ref consecutiveErrors) >= 3)
+                {
+                    return;
+                }
+
+                var deleteUrl = $"{baseUrl}/components/{component.Id}";
+                using var response = await httpClient.DeleteAsync(deleteUrl, cancellationToken);
+
+                var currentCount = Interlocked.Increment(ref successCount) + failureCount;
+
+                if (response.IsSuccessStatusCode)
+                {
+                    Console.WriteLine($"[{currentCount}/{total}] [Success] Deleted: {component.Name} ({component.Version})");
+                    Volatile.Write(ref consecutiveErrors, 0);
+                }
+                else
+                {
+                    Interlocked.Decrement(ref successCount);
+                    Interlocked.Increment(ref failureCount);
+                    Console.Error.WriteLine($"[{currentCount}/{total}] [Failed]  {component.Name} ({component.Version}) - Status: {response.StatusCode}");
+
+                    if ((int)response.StatusCode >= 500)
+                    {
+                        if (Interlocked.Increment(ref consecutiveErrors) >= 3)
+                        {
+                            Console.Error.WriteLine("Too many consecutive server errors. Aborting for safety.");
+                        }
+                    }
+                    else
+                    {
+                        Volatile.Write(ref consecutiveErrors, 0);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Interlocked.Increment(ref failureCount);
+                Console.Error.WriteLine($"[Error] Unexpected error for {component.Name}: {ex.Message}");
+            }
+            finally
+            {
+                concurrencyLimiter.Release();
+            }
+        });
+
+        await Task.WhenAll(tasks);
+
+        Console.WriteLine("\n--- Deletion Summary ---");
+        Console.WriteLine($"Total Attempted: {total}");
+        Console.WriteLine($"Successfully Deleted: {successCount}");
+        Console.WriteLine($"Failed: {failureCount}");
+
+        return failureCount == 0 ? 0 : 1;
     }
 
     private static async Task<int> RunCountAsync(
@@ -623,7 +740,8 @@ internal enum CommandType
 {
     Count,
     ListComponents,
-    ListAssets
+    ListAssets,
+    DeleteComponents
 }
 
 internal enum SortField
@@ -720,11 +838,13 @@ internal sealed class CommandLineOptions
           nexus-component-counter count --url <nexus-api-url> [--type <repo-type>] [--format <repo-format>] [--concurrency <count>] [--output-dir <directory>]
           nexus-component-counter list-components --url <nexus-api-url> --repository <repo-name> [--sort-by <name|version|age|last-modified|last-downloaded>] [--order <asc|desc>] [--limit <count>] [--output <file>]
           nexus-component-counter list-assets --url <nexus-api-url> --repository <repo-name> [--sort-by <name|version|age|last-modified|last-downloaded>] [--order <asc|desc>] [--limit <count>] [--output <file>]
+          nexus-component-counter delete-components --url <nexus-api-url> --input <file> [--force] [--concurrency <count>]
 
         Commands:
           count             Count components per repository. The bare command without a subcommand behaves the same way.
           list-components   List components in a repository and sort the results client-side.
           list-assets       List assets in a repository and sort the results client-side.
+          delete-components Bulk delete components from a JSON input file generated by list-components.
 
         Common options:
           --url             Required. Base URL for the Nexus REST API.
@@ -743,6 +863,11 @@ internal sealed class CommandLineOptions
           --order           Optional. Sort order. Default: desc.
           --limit           Optional. Maximum number of rows to return after sorting.
           --output          Optional. File path for JSON output. If omitted, JSON is written to stdout.
+
+        Delete options:
+          --input           Required for delete-components. Path to the JSON file containing components to delete.
+          --force           Optional. Actually execute deletion. If omitted, performs a dry run.
+          --concurrency     Optional for delete-components. Default: 2.
 
         Notes:
           age sorting uses blobCreated when available and falls back to lastModified.
@@ -775,6 +900,10 @@ internal sealed class CommandLineOptions
 
     public string? OutputPath { get; init; }
 
+    public string? InputPath { get; init; }
+
+    public bool Force { get; init; }
+
     public static ParsedOptions Parse(string[] args)
     {
         if (args.Length == 0)
@@ -794,6 +923,10 @@ internal sealed class CommandLineOptions
                     startIndex = 1;
                     break;
                 case "list-components":
+                case "delete-components":
+                    command = CommandType.DeleteComponents;
+                    startIndex = 1;
+                    break;
                     command = CommandType.ListComponents;
                     startIndex = 1;
                     break;
@@ -812,6 +945,9 @@ internal sealed class CommandLineOptions
         var concurrency = 10;
         string? outputDirectory = null;
         string? repository = null;
+        string? inputPath = null;
+        var force = false;
+        int? customConcurrency = null;
         var sortBy = SortField.Name;
         var sortOrder = SortDirection.Desc;
         int? limit = null;
@@ -838,7 +974,7 @@ internal sealed class CommandLineOptions
 
             string? optionValue = inlineValue;
 
-            if (optionValue is null)
+            if (optionValue is null && optionName != "--force")
             {
                 if (index + 1 >= args.Length)
                 {
@@ -860,7 +996,7 @@ internal sealed class CommandLineOptions
                     repositoryFormat = optionValue;
                     break;
                 case "--concurrency":
-                    if (!int.TryParse(optionValue, out concurrency) || concurrency <= 0)
+                    if (!int.TryParse(optionValue, out var parsedConcurrency) || parsedConcurrency <= 0)
                     {
                         return new ParsedOptions(
                             null,
@@ -869,7 +1005,7 @@ internal sealed class CommandLineOptions
                             "Concurrency must be a positive integer."
                         );
                     }
-
+                    customConcurrency = parsedConcurrency;
                     break;
                 case "--output-dir":
                     outputDirectory = optionValue;
@@ -917,6 +1053,24 @@ internal sealed class CommandLineOptions
                 case "--output":
                     outputPath = optionValue;
                     break;
+                case "--input":
+                    inputPath = optionValue;
+                    break;
+                case "--force":
+                    force = true;
+                    // --force is a flag, so we don't consume the next argument unless it's inline
+                    if (inlineValue is null)
+                    {
+                        // Roll back the index increment if we didn't use an inline value
+                        // Wait, common way: if it's a flag, we don't increment index if it was't inline.
+                        // The current loop structure always increments if optionValue was null.
+                        // Let's adjust the logic slightly for flags.
+                    }
+                    else if (bool.TryParse(inlineValue, out var parsedForce))
+                    {
+                        force = parsedForce;
+                    }
+                    break;
                 default:
                     return new ParsedOptions(
                         null,
@@ -933,12 +1087,14 @@ internal sealed class CommandLineOptions
         }
 
         if (
-            command is CommandType.ListComponents or CommandType.ListAssets
-            && string.IsNullOrWhiteSpace(repository)
+            command is CommandType.DeleteComponents
+            && string.IsNullOrWhiteSpace(inputPath)
         )
         {
-            return new ParsedOptions(null, false, false, "The --repository option is required.");
+            return new ParsedOptions(null, false, false, "The --input option is required for delete-components.");
         }
+
+        var finalConcurrency = customConcurrency ?? (command == CommandType.DeleteComponents ? 2 : 10);
 
         return new ParsedOptions(
             new CommandLineOptions
@@ -949,7 +1105,7 @@ internal sealed class CommandLineOptions
                 RepositoryFormat = string.IsNullOrWhiteSpace(repositoryFormat)
                     ? null
                     : repositoryFormat,
-                Concurrency = concurrency,
+                Concurrency = finalConcurrency,
                 OutputDirectory = string.IsNullOrWhiteSpace(outputDirectory)
                     ? Directory.GetCurrentDirectory()
                     : outputDirectory,
@@ -957,7 +1113,9 @@ internal sealed class CommandLineOptions
                 SortBy = sortBy,
                 SortOrder = sortOrder,
                 Limit = limit,
-                OutputPath = string.IsNullOrWhiteSpace(outputPath) ? null : outputPath
+                OutputPath = string.IsNullOrWhiteSpace(outputPath) ? null : outputPath,
+                InputPath = inputPath,
+                Force = force
             },
             false,
             false,
