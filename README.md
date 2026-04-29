@@ -25,8 +25,8 @@ This project uses GitHub Actions to automatically create releases. When a new ta
 - **NuGet Package**: A `.nupkg` file for installation as a .NET Tool.
 
 ```powershell
-git tag v1.0.4
-git push origin v1.0.4
+git tag v1.0.6
+git push origin v1.0.6
 ```
 
 ### Manual Build
@@ -112,6 +112,8 @@ nexus-component-counter delete-components --url <nexus-api-url> --input <file> [
 | `--order` | Sort order (`asc`, `desc`). Default: `desc` |
 | `--limit` | Maximum number of rows to return |
 | `--output` | File path for JSON output. If omitted, writes to stdout |
+| `--name-pattern` | Optional. Regex pattern to filter component names client-side |
+| `--version-pattern` | Optional. Regex pattern to filter component versions client-side |
 
 #### Delete Components
 | Option | Description |
@@ -180,6 +182,24 @@ Write list output to a specific file:
 ```powershell
 dotnet run -- list-components --url https://nexus.example.com/service/rest/v1 --repository maven-public --output maven_components.json
 # writes ./maven_components.json
+```
+
+### Pattern Filtering
+
+Find components with a specific name pattern using regex:
+
+```powershell
+# Find all components containing "spring" (case-insensitive)
+dotnet run -- list-components --url https://nexus.example.com/service/rest/v1 --repository maven-public --name-pattern "spring"
+
+# Find components starting with "log4j"
+dotnet run -- list-components --url https://nexus.example.com/service/rest/v1 --repository maven-public --name-pattern "^log4j"
+
+# Find components with version containing "pre-alpha"
+dotnet run -- list-components --url https://nexus.example.com/service/rest/v1 --repository maven-public --version-pattern "pre-alpha"
+
+# Find components with name "spring-core" and version starting with "5."
+dotnet run -- list-components --url https://nexus.example.com/service/rest/v1 --repository maven-public --name-pattern "^spring-core$" --version-pattern "^5\."
 ```
 
 ### List assets

@@ -280,7 +280,43 @@ internal static class NexusComponentCounterApp
             cancellationToken
         );
 
-        var results = components
+        IEnumerable<ComponentResponse> filteredComponents = components;
+
+        if (!string.IsNullOrWhiteSpace(options.NamePattern))
+        {
+            try
+            {
+                var regex = new System.Text.RegularExpressions.Regex(
+                    options.NamePattern,
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled
+                );
+                filteredComponents = components.Where(c => regex.IsMatch(c.Name));
+            }
+            catch (ArgumentException ex)
+            {
+                Console.Error.WriteLine($"Invalid name regex pattern: {ex.Message}");
+                return 1;
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(options.VersionPattern))
+        {
+            try
+            {
+                var regex = new System.Text.RegularExpressions.Regex(
+                    options.VersionPattern,
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled
+                );
+                filteredComponents = filteredComponents.Where(c => !string.IsNullOrEmpty(c.Version) && regex.IsMatch(c.Version));
+            }
+            catch (ArgumentException ex)
+            {
+                Console.Error.WriteLine($"Invalid version regex pattern: {ex.Message}");
+                return 1;
+            }
+        }
+
+        var results = filteredComponents
             .Select(CreateListComponentResult)
             .ToList();
 
@@ -836,7 +872,7 @@ internal sealed class CommandLineOptions
         Usage:
           nexus-component-counter --url <nexus-api-url> [--type <repo-type>] [--format <repo-format>] [--concurrency <count>] [--output-dir <directory>]
           nexus-component-counter count --url <nexus-api-url> [--type <repo-type>] [--format <repo-format>] [--concurrency <count>] [--output-dir <directory>]
-          nexus-component-counter list-components --url <nexus-api-url> --repository <repo-name> [--sort-by <name|version|age|last-modified|last-downloaded>] [--order <asc|desc>] [--limit <count>] [--output <file>]
+          nexus-component-counter list-components --url <nexus-api-url> --repository <repo-name> [--sort-by <name|version|age|last-modified|last-downloaded>] [--order <asc|desc>] [--limit <count>] [--output <file>] [--name-pattern <regex>] [--version-pattern <regex>]
           nexus-component-counter list-assets --url <nexus-api-url> --repository <repo-name> [--sort-by <name|version|age|last-modified|last-downloaded>] [--order <asc|desc>] [--limit <count>] [--output <file>]
           nexus-component-counter delete-components --url <nexus-api-url> --input <file> [--force] [--concurrency <count>]
 
@@ -863,6 +899,8 @@ internal sealed class CommandLineOptions
           --order           Optional. Sort order. Default: desc.
           --limit           Optional. Maximum number of rows to return after sorting.
           --output          Optional. File path for JSON output. If omitted, JSON is written to stdout.
+          --name-pattern    Optional. Regex pattern to filter component names client-side.
+          --version-pattern Optional. Regex pattern to filter component versions client-side.
 
         Delete options:
           --input           Required for delete-components. Path to the JSON file containing components to delete.
@@ -904,6 +942,10 @@ internal sealed class CommandLineOptions
 
     public bool Force { get; init; }
 
+
+    public string? VersionPattern { get; init; }
+    public string? NamePattern { get; init; }
+
     public static ParsedOptions Parse(string[] args)
     {
         if (args.Length == 0)
@@ -923,15 +965,15 @@ internal sealed class CommandLineOptions
                     startIndex = 1;
                     break;
                 case "list-components":
-                case "delete-components":
-                    command = CommandType.DeleteComponents;
-                    startIndex = 1;
-                    break;
                     command = CommandType.ListComponents;
                     startIndex = 1;
                     break;
                 case "list-assets":
                     command = CommandType.ListAssets;
+                    startIndex = 1;
+                    break;
+                case "delete-components":
+                    command = CommandType.DeleteComponents;
                     startIndex = 1;
                     break;
                 default:
@@ -947,7 +989,9 @@ internal sealed class CommandLineOptions
         string? repository = null;
         string? inputPath = null;
         var force = false;
+        string? versionPattern = null;
         int? customConcurrency = null;
+        string? namePattern = null;
         var sortBy = SortField.Name;
         var sortOrder = SortDirection.Desc;
         int? limit = null;
@@ -1053,6 +1097,12 @@ internal sealed class CommandLineOptions
                 case "--output":
                     outputPath = optionValue;
                     break;
+                case "--version-pattern":
+                    versionPattern = optionValue;
+                    break;
+                case "--name-pattern":
+                    namePattern = optionValue;
+                    break;
                 case "--input":
                     inputPath = optionValue;
                     break;
@@ -1115,7 +1165,9 @@ internal sealed class CommandLineOptions
                 Limit = limit,
                 OutputPath = string.IsNullOrWhiteSpace(outputPath) ? null : outputPath,
                 InputPath = inputPath,
-                Force = force
+                Force = force,
+                NamePattern = namePattern,
+                VersionPattern = versionPattern
             },
             false,
             false,
