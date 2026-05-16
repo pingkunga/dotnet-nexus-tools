@@ -9,6 +9,7 @@ A .NET 10 command-line tool that counts components in Sonatype Nexus repositorie
 - Processes repositories concurrently
 - Handles Nexus component pagination with `continuationToken`
 - Continuously writes sorted JSON output as repositories complete
+- Generates HTML reports for easy viewing or embedding in emails (e.g., Jenkins body)
 - Lists components and assets with server-side sorting and limiting
 - Bulk deletes components using JSON input with safety (dry-run) and concurrency control
 
@@ -103,6 +104,7 @@ nexus-component-counter delete-components --url <nexus-api-url> --input <file> [
 | `--format` | Filter repositories by format |
 | `--concurrency` | Concurrency for repository processing. Default: `10` |
 | `--output-dir` | Directory for the JSON results file |
+| `--html` | Optional. Generate an HTML report in addition to JSON |
 
 #### List (Components/Assets)
 | Option | Description |
@@ -112,6 +114,7 @@ nexus-component-counter delete-components --url <nexus-api-url> --input <file> [
 | `--order` | Sort order (`asc`, `desc`). Default: `desc` |
 | `--limit` | Maximum number of rows to return |
 | `--output` | File path for JSON output. If omitted, writes to stdout |
+| `--html` | Optional. Generate an HTML report in addition to JSON |
 | `--name-pattern` | Optional. Regex pattern to filter component names client-side |
 | `--version-pattern` | Optional. Regex pattern to filter component versions client-side |
 
@@ -197,6 +200,22 @@ dotnet run -- list-components --url https://nexus.example.com/service/rest/v1 --
 
 # Find components with version containing "pre-alpha"
 dotnet run -- list-components --url https://nexus.example.com/service/rest/v1 --repository maven-public --version-pattern "pre-alpha"
+
+### HTML Reports
+
+The tool can generate HTML reports suitable for email bodies (e.g., Jenkins notification emails). The HTML file will be created in the same directory as the JSON output with a `.html` extension.
+
+Generate component count report:
+```powershell
+.\tools\nexus-component-counter.exe --url https://nexus.example.com/service/rest/v1 --html
+# Produces: RepoTypeAll_FormatAll_components.json and RepoTypeAll_FormatAll_components.html
+```
+
+Generate list report:
+```powershell
+.\tools\nexus-component-counter.exe list-components --url https://nexus.example.com/service/rest/v1 --repository maven-public --html
+# Produces: maven-public_components.json and maven-public_components.html
+```
 
 # Find components with name "spring-core" and version starting with "5."
 dotnet run -- list-components --url https://nexus.example.com/service/rest/v1 --repository maven-public --name-pattern "^spring-core$" --version-pattern "^5\."

@@ -236,6 +236,12 @@ internal static class NexusComponentCounterApp
                 cancellationToken
             );
 
+            if (options.HtmlReport)
+            {
+                var htmlOutputPath = Path.ChangeExtension(outputPath, ".html");
+                await WriteHtmlReportAsync(htmlOutputPath, "Nexus Repository Component Counts", ["Repository", "Type", "Format", "Count"], Array.Empty<string?[]>(), cancellationToken);
+            }
+
             return 0;
         }
 
@@ -259,6 +265,7 @@ internal static class NexusComponentCounterApp
                     repositories.Count,
                     () => Volatile.Read(ref completedRepositories),
                     () => Interlocked.Increment(ref completedRepositories),
+                    options,
                     cancellationToken
                 )
         );
@@ -333,6 +340,13 @@ internal static class NexusComponentCounterApp
         }
 
         await WriteJsonOutputAsync(listOutputPath, limitedResults, cancellationToken);
+
+        if (options.HtmlReport)
+        {
+            var htmlOutputPath = Path.ChangeExtension(listOutputPath, ".html");
+            await WriteHtmlReportAsync(htmlOutputPath, $"Components in {options.Repository}", ["Repository", "Group", "Name", "Version", "Assets", "Age", "Last Modified", "Last Downloaded"], limitedResults.Select(c => new string?[] { c.Repository, c.Group, c.Name, c.Version, c.AssetCount.ToString(), c.AgeTimestamp?.ToString("yyyy-MM-dd HH:mm:ss"), c.LastModified?.ToString("yyyy-MM-dd HH:mm:ss"), c.LastDownloaded?.ToString("yyyy-MM-dd HH:mm:ss") }), cancellationToken);
+        }
+
         return 0;
     }
 
@@ -366,6 +380,13 @@ internal static class NexusComponentCounterApp
         }
 
         await WriteJsonOutputAsync(listOutputPath, limitedResults, cancellationToken);
+
+        if (options.HtmlReport)
+        {
+            var htmlOutputPath = Path.ChangeExtension(listOutputPath, ".html");
+            await WriteHtmlReportAsync(htmlOutputPath, $"Assets in {options.Repository}", ["Repository", "Path", "Size", "Age", "Last Modified", "Last Downloaded"], limitedResults.Select(a => new string?[] { a.Repository, a.Path, a.FileSize?.ToString(), a.AgeTimestamp?.ToString("yyyy-MM-dd HH:mm:ss"), a.LastModified?.ToString("yyyy-MM-dd HH:mm:ss"), a.LastDownloaded?.ToString("yyyy-MM-dd HH:mm:ss") }), cancellationToken);
+        }
+
         return 0;
     }
 
@@ -432,6 +453,7 @@ internal static class NexusComponentCounterApp
         int totalRepositories,
         Func<int> getCompletedCount,
         Func<int> incrementCompletedCount,
+        CommandLineOptions options,
         CancellationToken cancellationToken
     )
     {
@@ -491,6 +513,12 @@ internal static class NexusComponentCounterApp
                 orderedResults,
                 cancellationToken
             );
+
+            if (options.HtmlReport)
+            {
+                var htmlOutputPath = Path.ChangeExtension(outputPath, ".html");
+                await WriteHtmlReportAsync(htmlOutputPath, "Nexus Repository Component Counts", ["Repository", "Type", "Format", "Count"], orderedResults.Select(r => new string?[] { r.Key, r.Value.Type, r.Value.Format, r.Value.Count.ToString() }), cancellationToken);
+            }
         }
         finally
         {
@@ -770,6 +798,62 @@ internal static class NexusComponentCounterApp
 
         return builder.ToString();
     }
+
+    private static async Task WriteHtmlReportAsync(
+        string outputPath,
+        string title,
+        string[] headers,
+        IEnumerable<string?[]> rows,
+        CancellationToken cancellationToken
+    )
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("<!DOCTYPE html>");
+        sb.AppendLine("<html>");
+        sb.AppendLine("<head>");
+        sb.AppendLine($"<title>{title}</title>");
+        sb.AppendLine("<style>");
+        sb.AppendLine("body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; margin: 20px; color: #333; }");
+        sb.AppendLine("h2 { color: #0056b3; border-bottom: 2px solid #eee; padding-bottom: 10px; }");
+        sb.AppendLine("table { border-collapse: collapse; width: 100%; margin-top: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }");
+        sb.AppendLine("th, td { text-align: left; padding: 12px 15px; border: 1px solid #ddd; }");
+        sb.AppendLine("th { background-color: #f8f9fa; font-weight: bold; color: #495057; }");
+        sb.AppendLine("tr:nth-child(even) { background-color: #f2f2f2; }");
+        sb.AppendLine("tr:hover { background-color: #e9ecef; }");
+        sb.AppendLine(".footer { margin-top: 30px; font-size: 0.85em; color: #6c757d; border-top: 1px solid #eee; padding-top: 10px; }");
+        sb.AppendLine("</style>");
+        sb.AppendLine("</head>");
+        sb.AppendLine("<body>");
+        sb.AppendLine($"<h2>{title}</h2>");
+        sb.AppendLine("<table>");
+        sb.AppendLine("<thead><tr>");
+        foreach (var header in headers)
+        {
+            sb.AppendLine($"<th>{header}</th>");
+        }
+        sb.AppendLine("</tr></thead>");
+        sb.AppendLine("<tbody>");
+
+        foreach (var row in rows)
+        {
+            sb.AppendLine("<tr>");
+            foreach (var cell in row)
+            {
+                sb.AppendLine($"<td>{System.Net.WebUtility.HtmlEncode(cell ?? "-")}</td>");
+            }
+            sb.AppendLine("</tr>");
+        }
+
+        sb.AppendLine("</tbody>");
+        sb.AppendLine("</table>");
+        sb.AppendLine("<div class='footer'>");
+        sb.AppendLine($"Generated on: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        sb.AppendLine("</div>");
+        sb.AppendLine("</body>");
+        sb.AppendLine("</html>");
+
+        await File.WriteAllTextAsync(outputPath, sb.ToString(), cancellationToken);
+    }
 }
 
 internal enum CommandType
@@ -892,6 +976,7 @@ internal sealed class CommandLineOptions
           --format          Optional. Filter repositories by format.
           --concurrency     Optional. Maximum number of repositories processed concurrently. Default: 10.
           --output-dir      Optional. Directory for the JSON results file. Default: current directory.
+          --html            Optional. Generate an HTML report in addition to JSON.
 
         List options:
           --repository      Required. Repository name to inspect.
@@ -899,6 +984,7 @@ internal sealed class CommandLineOptions
           --order           Optional. Sort order. Default: desc.
           --limit           Optional. Maximum number of rows to return after sorting.
           --output          Optional. File path for JSON output. If omitted, JSON is written to stdout.
+          --html            Optional. Generate an HTML report in addition to JSON. (Requires --output or writes to default).
           --name-pattern    Optional. Regex pattern to filter component names client-side.
           --version-pattern Optional. Regex pattern to filter component versions client-side.
 
@@ -942,6 +1028,7 @@ internal sealed class CommandLineOptions
 
     public bool Force { get; init; }
 
+    public bool HtmlReport { get; init; }
 
     public string? VersionPattern { get; init; }
     public string? NamePattern { get; init; }
@@ -989,6 +1076,7 @@ internal sealed class CommandLineOptions
         string? repository = null;
         string? inputPath = null;
         var force = false;
+        var htmlReport = false;
         string? versionPattern = null;
         int? customConcurrency = null;
         string? namePattern = null;
@@ -1018,7 +1106,7 @@ internal sealed class CommandLineOptions
 
             string? optionValue = inlineValue;
 
-            if (optionValue is null && optionName != "--force")
+            if (optionValue is null && optionName != "--force" && optionName != "--html")
             {
                 if (index + 1 >= args.Length)
                 {
@@ -1097,6 +1185,13 @@ internal sealed class CommandLineOptions
                 case "--output":
                     outputPath = optionValue;
                     break;
+                case "--html":
+                    htmlReport = true;
+                    if (inlineValue is not null && bool.TryParse(inlineValue, out var parsedHtml))
+                    {
+                        htmlReport = parsedHtml;
+                    }
+                    break;
                 case "--version-pattern":
                     versionPattern = optionValue;
                     break;
@@ -1166,6 +1261,7 @@ internal sealed class CommandLineOptions
                 OutputPath = string.IsNullOrWhiteSpace(outputPath) ? null : outputPath,
                 InputPath = inputPath,
                 Force = force,
+                HtmlReport = htmlReport,
                 NamePattern = namePattern,
                 VersionPattern = versionPattern
             },
