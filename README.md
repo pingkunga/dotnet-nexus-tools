@@ -288,4 +288,51 @@ The JSON output is sorted by component count in descending order:
 
 - The tool fails fast if `NEXUS_USERNAME` or `NEXUS_PASSWORD` is not set.
 - The `--url` value should point to the Nexus REST API base, typically ending with `service/rest/v1`.
-- The original Python script is kept in the repository as `nexus_component_counter.py` for reference during the migration.
+
+
+
+
+dotnet tool update --global Nexus.Tool --add-source "D:\06Utility\nupkgForBuild"
+
+
+
+graph TD
+    Start([Start]) --> RunAsync[NexusComponentCounterApp.RunAsync]
+    RunAsync --> Parse[CommandLineOptions.Parse]
+    Parse --> CreateClient[CreateHttpClient]
+    
+    CreateClient --> CommandSwitch{CommandType?}
+
+    subgraph CountFlow [Count Command]
+        CommandSwitch -- Count --> RunCountAsync[RunCountAsync]
+        RunCountAsync --> GetRepos[GetRepositoriesAsync]
+        GetRepos --> CountRepoComp[CountRepositoryComponentsAsync]
+        CountRepoComp --> WriteJsonCount[WriteRepositoryCountResultsFileAsync]
+        WriteJsonCount --> CheckHtmlCount{options.HtmlReport?}
+        CheckHtmlCount -- Yes --> WriteHtmlCount[WriteHtmlReportAsync]
+        CheckHtmlCount -- No --> CountDone[Done]
+        WriteHtmlCount --> CountDone
+    end
+
+    subgraph ListFlow [List-Components/Assets]
+        CommandSwitch -- List --> RunList[RunListComponentsAsync / RunListAssetsAsync]
+        RunList --> GetAllPages[GetAllPagesAsync]
+        GetAllPages --> SortLimit[SortResults / ApplyLimit]
+        SortLimit --> WriteJsonList[WriteJsonOutputAsync]
+        WriteJsonList --> CheckHtmlList{options.HtmlReport?}
+        CheckHtmlList -- Yes --> WriteHtmlList[WriteHtmlReportAsync]
+        CheckHtmlList -- No --> ListDone[Done]
+        WriteHtmlList --> ListDone
+    end
+
+    subgraph DeleteFlow [Delete-Components]
+        CommandSwitch -- Delete --> RunDelete[RunDeleteComponentsAsync]
+        RunDelete --> ForceCheck{options.Force?}
+        ForceCheck -- No --> DryRun[Dry Run Mode]
+        ForceCheck -- Yes --> HttpDelete[httpClient.DeleteAsync]
+    end
+
+    CountDone --> End([End])
+    ListDone --> End
+    DryRun --> End
+    HttpDelete --> End
