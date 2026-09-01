@@ -21,6 +21,14 @@ internal static class NexusComponentCounterApp
             return parseResult.ExitCode;
         }
 
+        if (parseResult.ShowVersion)
+        {
+            var version =
+                typeof(NexusComponentCounterApp).Assembly.GetName().Version?.ToString() ?? "1.0.0";
+            Console.WriteLine(version);
+            return 0;
+        }
+
         if (parseResult.ErrorMessage is not null)
         {
             Console.Error.WriteLine(parseResult.ErrorMessage);
@@ -60,8 +68,125 @@ internal static class NexusComponentCounterApp
                 options,
                 CancellationToken.None
             ),
+            CommandType.DeleteComponents => await RunDeleteComponentsAsync(
+                baseUrl,
+                httpClient,
+                options,
+                CancellationToken.None
+            ),
             _ => throw new InvalidOperationException($"Unsupported command '{options.Command}'.")
         };
+    }
+
+    private static async Task<int> RunDeleteComponentsAsync(
+        string baseUrl,
+        HttpClient httpClient,
+        CommandLineOptions options,
+        CancellationToken cancellationToken
+    )
+    {
+        if (string.IsNullOrWhiteSpace(options.InputPath) || !File.Exists(options.InputPath))
+        {
+            Console.Error.WriteLine($"Input file not found: {options.InputPath}");
+            return 1;
+        }
+
+        List<ListComponentResult>? componentsToDelete;
+        try
+        {
+            var json = await File.ReadAllTextAsync(options.InputPath, cancellationToken);
+            componentsToDelete = JsonSerializer.Deserialize<List<ListComponentResult>>(json, JsonOptions);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Failed to parse input file: {ex.Message}");
+            return 1;
+        }
+
+        if (componentsToDelete == null || componentsToDelete.Count == 0)
+        {
+            Console.WriteLine("No components found in input file to delete.");
+            return 0;
+        }
+
+        if (!options.Force)
+        {
+            Console.WriteLine("--- DRY RUN MODE --- (Use --force to actually delete)");
+            foreach (var component in componentsToDelete)
+            {
+                Console.WriteLine($"[Dry-Run] Would delete: {component.Repository} | {component.Group ?? "no-group"} | {component.Name} | {component.Version} (ID: {component.Id})");
+            }
+            Console.WriteLine($"--- Total components to delete: {componentsToDelete.Count} ---");
+            Console.WriteLine("Reminder: Add --force flag to execute deletion.");
+            return 0;
+        }
+
+        Console.WriteLine($"Starting bulk deletion of {componentsToDelete.Count} components with concurrency {options.Concurrency}...");
+
+        var concurrencyLimiter = new SemaphoreSlim(options.Concurrency);
+        var successCount = 0;
+        var failureCount = 0;
+        var consecutiveErrors = 0;
+        var total = componentsToDelete.Count;
+
+        var tasks = componentsToDelete.Select(async (component, index) =>
+        {
+            await concurrencyLimiter.WaitAsync(cancellationToken);
+            try
+            {
+                if (Volatile.Read(ref consecutiveErrors) >= 3)
+                {
+                    return;
+                }
+
+                var deleteUrl = $"{baseUrl}/components/{component.Id}";
+                using var response = await httpClient.DeleteAsync(deleteUrl, cancellationToken);
+
+                var currentCount = Interlocked.Increment(ref successCount) + failureCount;
+
+                if (response.IsSuccessStatusCode)
+                {
+                    Console.WriteLine($"[{currentCount}/{total}] [Success] Deleted: {component.Name} ({component.Version})");
+                    Volatile.Write(ref consecutiveErrors, 0);
+                }
+                else
+                {
+                    Interlocked.Decrement(ref successCount);
+                    Interlocked.Increment(ref failureCount);
+                    Console.Error.WriteLine($"[{currentCount}/{total}] [Failed]  {component.Name} ({component.Version}) - Status: {response.StatusCode}");
+
+                    if ((int)response.StatusCode >= 500)
+                    {
+                        if (Interlocked.Increment(ref consecutiveErrors) >= 3)
+                        {
+                            Console.Error.WriteLine("Too many consecutive server errors. Aborting for safety.");
+                        }
+                    }
+                    else
+                    {
+                        Volatile.Write(ref consecutiveErrors, 0);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Interlocked.Increment(ref failureCount);
+                Console.Error.WriteLine($"[Error] Unexpected error for {component.Name}: {ex.Message}");
+            }
+            finally
+            {
+                concurrencyLimiter.Release();
+            }
+        });
+
+        await Task.WhenAll(tasks);
+
+        Console.WriteLine("\n--- Deletion Summary ---");
+        Console.WriteLine($"Total Attempted: {total}");
+        Console.WriteLine($"Successfully Deleted: {successCount}");
+        Console.WriteLine($"Failed: {failureCount}");
+
+        return failureCount == 0 ? 0 : 1;
     }
 
     private static async Task<int> RunCountAsync(
@@ -111,6 +236,12 @@ internal static class NexusComponentCounterApp
                 cancellationToken
             );
 
+            if (options.HtmlReport)
+            {
+                var htmlOutputPath = Path.ChangeExtension(outputPath, ".html");
+                await WriteHtmlReportAsync(htmlOutputPath, "Nexus Repository Component Counts", ["Repository", "Type", "Format", "Count"], Array.Empty<string?[]>(), cancellationToken);
+            }
+
             return 0;
         }
 
@@ -134,6 +265,7 @@ internal static class NexusComponentCounterApp
                     repositories.Count,
                     () => Volatile.Read(ref completedRepositories),
                     () => Interlocked.Increment(ref completedRepositories),
+                    options,
                     cancellationToken
                 )
         );
@@ -155,7 +287,43 @@ internal static class NexusComponentCounterApp
             cancellationToken
         );
 
-        var results = components
+        IEnumerable<ComponentResponse> filteredComponents = components;
+
+        if (!string.IsNullOrWhiteSpace(options.NamePattern))
+        {
+            try
+            {
+                var regex = new System.Text.RegularExpressions.Regex(
+                    options.NamePattern,
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled
+                );
+                filteredComponents = components.Where(c => regex.IsMatch(c.Name));
+            }
+            catch (ArgumentException ex)
+            {
+                Console.Error.WriteLine($"Invalid name regex pattern: {ex.Message}");
+                return 1;
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(options.VersionPattern))
+        {
+            try
+            {
+                var regex = new System.Text.RegularExpressions.Regex(
+                    options.VersionPattern,
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled
+                );
+                filteredComponents = filteredComponents.Where(c => !string.IsNullOrEmpty(c.Version) && regex.IsMatch(c.Version));
+            }
+            catch (ArgumentException ex)
+            {
+                Console.Error.WriteLine($"Invalid version regex pattern: {ex.Message}");
+                return 1;
+            }
+        }
+
+        var results = filteredComponents
             .Select(CreateListComponentResult)
             .ToList();
 
@@ -172,6 +340,13 @@ internal static class NexusComponentCounterApp
         }
 
         await WriteJsonOutputAsync(listOutputPath, limitedResults, cancellationToken);
+
+        if (options.HtmlReport)
+        {
+            var htmlOutputPath = Path.ChangeExtension(listOutputPath, ".html");
+            await WriteHtmlReportAsync(htmlOutputPath, $"Components in {options.Repository}", ["Repository", "Group", "Name", "Version", "Assets", "Age", "Last Modified", "Last Downloaded"], limitedResults.Select(c => new string?[] { c.Repository, c.Group, c.Name, c.Version, c.AssetCount.ToString(), c.AgeTimestamp?.ToString("yyyy-MM-dd HH:mm:ss"), c.LastModified?.ToString("yyyy-MM-dd HH:mm:ss"), c.LastDownloaded?.ToString("yyyy-MM-dd HH:mm:ss") }), cancellationToken);
+        }
+
         return 0;
     }
 
@@ -205,6 +380,13 @@ internal static class NexusComponentCounterApp
         }
 
         await WriteJsonOutputAsync(listOutputPath, limitedResults, cancellationToken);
+
+        if (options.HtmlReport)
+        {
+            var htmlOutputPath = Path.ChangeExtension(listOutputPath, ".html");
+            await WriteHtmlReportAsync(htmlOutputPath, $"Assets in {options.Repository}", ["Repository", "Path", "Size", "Age", "Last Modified", "Last Downloaded"], limitedResults.Select(a => new string?[] { a.Repository, a.Path, a.FileSize?.ToString(), a.AgeTimestamp?.ToString("yyyy-MM-dd HH:mm:ss"), a.LastModified?.ToString("yyyy-MM-dd HH:mm:ss"), a.LastDownloaded?.ToString("yyyy-MM-dd HH:mm:ss") }), cancellationToken);
+        }
+
         return 0;
     }
 
@@ -271,6 +453,7 @@ internal static class NexusComponentCounterApp
         int totalRepositories,
         Func<int> getCompletedCount,
         Func<int> incrementCompletedCount,
+        CommandLineOptions options,
         CancellationToken cancellationToken
     )
     {
@@ -330,6 +513,12 @@ internal static class NexusComponentCounterApp
                 orderedResults,
                 cancellationToken
             );
+
+            if (options.HtmlReport)
+            {
+                var htmlOutputPath = Path.ChangeExtension(outputPath, ".html");
+                await WriteHtmlReportAsync(htmlOutputPath, "Nexus Repository Component Counts", ["Repository", "Type", "Format", "Count"], orderedResults.Select(r => new string?[] { r.Key, r.Value.Type, r.Value.Format, r.Value.Count.ToString() }), cancellationToken);
+            }
         }
         finally
         {
@@ -411,6 +600,7 @@ internal static class NexusComponentCounterApp
             component.Group,
             component.Name,
             component.Version,
+            component.Id,
             assets.Length,
             createdCandidates.Length == 0 ? null : createdCandidates.Min(),
             modifiedCandidates.Length == 0 ? null : modifiedCandidates.Max(),
@@ -608,13 +798,70 @@ internal static class NexusComponentCounterApp
 
         return builder.ToString();
     }
+
+    private static async Task WriteHtmlReportAsync(
+        string outputPath,
+        string title,
+        string[] headers,
+        IEnumerable<string?[]> rows,
+        CancellationToken cancellationToken
+    )
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("<!DOCTYPE html>");
+        sb.AppendLine("<html>");
+        sb.AppendLine("<head>");
+        sb.AppendLine($"<title>{title}</title>");
+        sb.AppendLine("<style>");
+        sb.AppendLine("body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; margin: 20px; color: #333; }");
+        sb.AppendLine("h2 { color: #0056b3; border-bottom: 2px solid #eee; padding-bottom: 10px; }");
+        sb.AppendLine("table { border-collapse: collapse; width: 100%; margin-top: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }");
+        sb.AppendLine("th, td { text-align: left; padding: 12px 15px; border: 1px solid #ddd; }");
+        sb.AppendLine("th { background-color: #f8f9fa; font-weight: bold; color: #495057; }");
+        sb.AppendLine("tr:nth-child(even) { background-color: #f2f2f2; }");
+        sb.AppendLine("tr:hover { background-color: #e9ecef; }");
+        sb.AppendLine(".footer { margin-top: 30px; font-size: 0.85em; color: #6c757d; border-top: 1px solid #eee; padding-top: 10px; }");
+        sb.AppendLine("</style>");
+        sb.AppendLine("</head>");
+        sb.AppendLine("<body>");
+        sb.AppendLine($"<h2>{title}</h2>");
+        sb.AppendLine("<table>");
+        sb.AppendLine("<thead><tr>");
+        foreach (var header in headers)
+        {
+            sb.AppendLine($"<th>{header}</th>");
+        }
+        sb.AppendLine("</tr></thead>");
+        sb.AppendLine("<tbody>");
+
+        foreach (var row in rows)
+        {
+            sb.AppendLine("<tr>");
+            foreach (var cell in row)
+            {
+                sb.AppendLine($"<td>{System.Net.WebUtility.HtmlEncode(cell ?? "-")}</td>");
+            }
+            sb.AppendLine("</tr>");
+        }
+
+        sb.AppendLine("</tbody>");
+        sb.AppendLine("</table>");
+        sb.AppendLine("<div class='footer'>");
+        sb.AppendLine($"Generated on: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        sb.AppendLine("</div>");
+        sb.AppendLine("</body>");
+        sb.AppendLine("</html>");
+
+        await File.WriteAllTextAsync(outputPath, sb.ToString(), cancellationToken);
+    }
 }
 
 internal enum CommandType
 {
     Count,
     ListComponents,
-    ListAssets
+    ListAssets,
+    DeleteComponents
 }
 
 internal enum SortField
@@ -642,6 +889,7 @@ internal sealed record ListComponentResult(
     string? Group,
     string Name,
     string? Version,
+    string Id,
     int AssetCount,
     DateTimeOffset? AgeTimestamp,
     DateTimeOffset? LastModified,
@@ -696,6 +944,7 @@ internal sealed record NexusAssetResponse(
 internal sealed record ParsedOptions(
     CommandLineOptions? Options,
     bool ShowHelp,
+    bool ShowVersion,
     string? ErrorMessage,
     int ExitCode = 0
 );
@@ -707,23 +956,27 @@ internal sealed class CommandLineOptions
         Usage:
           nexus-component-counter --url <nexus-api-url> [--type <repo-type>] [--format <repo-format>] [--concurrency <count>] [--output-dir <directory>]
           nexus-component-counter count --url <nexus-api-url> [--type <repo-type>] [--format <repo-format>] [--concurrency <count>] [--output-dir <directory>]
-          nexus-component-counter list-components --url <nexus-api-url> --repository <repo-name> [--sort-by <name|version|age|last-modified|last-downloaded>] [--order <asc|desc>] [--limit <count>] [--output <file>]
+          nexus-component-counter list-components --url <nexus-api-url> --repository <repo-name> [--sort-by <name|version|age|last-modified|last-downloaded>] [--order <asc|desc>] [--limit <count>] [--output <file>] [--name-pattern <regex>] [--version-pattern <regex>]
           nexus-component-counter list-assets --url <nexus-api-url> --repository <repo-name> [--sort-by <name|version|age|last-modified|last-downloaded>] [--order <asc|desc>] [--limit <count>] [--output <file>]
+          nexus-component-counter delete-components --url <nexus-api-url> --input <file> [--force] [--concurrency <count>]
 
         Commands:
           count             Count components per repository. The bare command without a subcommand behaves the same way.
           list-components   List components in a repository and sort the results client-side.
           list-assets       List assets in a repository and sort the results client-side.
+          delete-components Bulk delete components from a JSON input file generated by list-components.
 
         Common options:
           --url             Required. Base URL for the Nexus REST API.
           -h, --help        Show this help message.
+          -v, --version     Show version information.
 
         Count options:
           --type            Optional. Filter repositories by type.
           --format          Optional. Filter repositories by format.
           --concurrency     Optional. Maximum number of repositories processed concurrently. Default: 10.
           --output-dir      Optional. Directory for the JSON results file. Default: current directory.
+          --html            Optional. Generate an HTML report in addition to JSON.
 
         List options:
           --repository      Required. Repository name to inspect.
@@ -731,6 +984,14 @@ internal sealed class CommandLineOptions
           --order           Optional. Sort order. Default: desc.
           --limit           Optional. Maximum number of rows to return after sorting.
           --output          Optional. File path for JSON output. If omitted, JSON is written to stdout.
+          --html            Optional. Generate an HTML report in addition to JSON. (Requires --output or writes to default).
+          --name-pattern    Optional. Regex pattern to filter component names client-side.
+          --version-pattern Optional. Regex pattern to filter component versions client-side.
+
+        Delete options:
+          --input           Required for delete-components. Path to the JSON file containing components to delete.
+          --force           Optional. Actually execute deletion. If omitted, performs a dry run.
+          --concurrency     Optional for delete-components. Default: 2.
 
         Notes:
           age sorting uses blobCreated when available and falls back to lastModified.
@@ -763,11 +1024,20 @@ internal sealed class CommandLineOptions
 
     public string? OutputPath { get; init; }
 
+    public string? InputPath { get; init; }
+
+    public bool Force { get; init; }
+
+    public bool HtmlReport { get; init; }
+
+    public string? VersionPattern { get; init; }
+    public string? NamePattern { get; init; }
+
     public static ParsedOptions Parse(string[] args)
     {
         if (args.Length == 0)
         {
-            return new ParsedOptions(null, true, null);
+            return new ParsedOptions(null, true, false, null);
         }
 
         var command = CommandType.Count;
@@ -789,8 +1059,12 @@ internal sealed class CommandLineOptions
                     command = CommandType.ListAssets;
                     startIndex = 1;
                     break;
+                case "delete-components":
+                    command = CommandType.DeleteComponents;
+                    startIndex = 1;
+                    break;
                 default:
-                    return new ParsedOptions(null, false, $"Unrecognized command '{args[0]}'.");
+                    return new ParsedOptions(null, false, false, $"Unrecognized command '{args[0]}'.");
             }
         }
 
@@ -800,6 +1074,12 @@ internal sealed class CommandLineOptions
         var concurrency = 10;
         string? outputDirectory = null;
         string? repository = null;
+        string? inputPath = null;
+        var force = false;
+        var htmlReport = false;
+        string? versionPattern = null;
+        int? customConcurrency = null;
+        string? namePattern = null;
         var sortBy = SortField.Name;
         var sortOrder = SortDirection.Desc;
         int? limit = null;
@@ -811,21 +1091,26 @@ internal sealed class CommandLineOptions
 
             if (argument is "-h" or "--help")
             {
-                return new ParsedOptions(null, true, null);
+                return new ParsedOptions(null, true, false, null);
+            }
+
+            if (argument is "-v" or "--version")
+            {
+                return new ParsedOptions(null, false, true, null);
             }
 
             if (!TrySplitArgument(argument, out var optionName, out var inlineValue))
             {
-                return new ParsedOptions(null, false, $"Unrecognized argument '{argument}'.");
+                return new ParsedOptions(null, false, false, $"Unrecognized argument '{argument}'.");
             }
 
             string? optionValue = inlineValue;
 
-            if (optionValue is null)
+            if (optionValue is null && optionName != "--force" && optionName != "--html")
             {
                 if (index + 1 >= args.Length)
                 {
-                    return new ParsedOptions(null, false, $"Missing value for '{optionName}'.");
+                    return new ParsedOptions(null, false, false, $"Missing value for '{optionName}'.");
                 }
 
                 optionValue = args[++index];
@@ -843,15 +1128,16 @@ internal sealed class CommandLineOptions
                     repositoryFormat = optionValue;
                     break;
                 case "--concurrency":
-                    if (!int.TryParse(optionValue, out concurrency) || concurrency <= 0)
+                    if (!int.TryParse(optionValue, out var parsedConcurrency) || parsedConcurrency <= 0)
                     {
                         return new ParsedOptions(
                             null,
                             false,
+                            false,
                             "Concurrency must be a positive integer."
                         );
                     }
-
+                    customConcurrency = parsedConcurrency;
                     break;
                 case "--output-dir":
                     outputDirectory = optionValue;
@@ -865,6 +1151,7 @@ internal sealed class CommandLineOptions
                         return new ParsedOptions(
                             null,
                             false,
+                            false,
                             $"Unsupported sort field '{optionValue}'."
                         );
                     }
@@ -875,6 +1162,7 @@ internal sealed class CommandLineOptions
                     {
                         return new ParsedOptions(
                             null,
+                            false,
                             false,
                             $"Unsupported sort order '{optionValue}'."
                         );
@@ -887,6 +1175,7 @@ internal sealed class CommandLineOptions
                         return new ParsedOptions(
                             null,
                             false,
+                            false,
                             "Limit must be a positive integer."
                         );
                     }
@@ -896,23 +1185,61 @@ internal sealed class CommandLineOptions
                 case "--output":
                     outputPath = optionValue;
                     break;
+                case "--html":
+                    htmlReport = true;
+                    if (inlineValue is not null && bool.TryParse(inlineValue, out var parsedHtml))
+                    {
+                        htmlReport = parsedHtml;
+                    }
+                    break;
+                case "--version-pattern":
+                    versionPattern = optionValue;
+                    break;
+                case "--name-pattern":
+                    namePattern = optionValue;
+                    break;
+                case "--input":
+                    inputPath = optionValue;
+                    break;
+                case "--force":
+                    force = true;
+                    // --force is a flag, so we don't consume the next argument unless it's inline
+                    if (inlineValue is null)
+                    {
+                        // Roll back the index increment if we didn't use an inline value
+                        // Wait, common way: if it's a flag, we don't increment index if it was't inline.
+                        // The current loop structure always increments if optionValue was null.
+                        // Let's adjust the logic slightly for flags.
+                    }
+                    else if (bool.TryParse(inlineValue, out var parsedForce))
+                    {
+                        force = parsedForce;
+                    }
+                    break;
                 default:
-                    return new ParsedOptions(null, false, $"Unrecognized argument '{optionName}'.");
+                    return new ParsedOptions(
+                        null,
+                        false,
+                        false,
+                        $"Unrecognized argument '{optionName}'."
+                    );
             }
         }
 
         if (string.IsNullOrWhiteSpace(url))
         {
-            return new ParsedOptions(null, false, "The --url option is required.");
+            return new ParsedOptions(null, false, false, "The --url option is required.");
         }
 
         if (
-            command is CommandType.ListComponents or CommandType.ListAssets
-            && string.IsNullOrWhiteSpace(repository)
+            command is CommandType.DeleteComponents
+            && string.IsNullOrWhiteSpace(inputPath)
         )
         {
-            return new ParsedOptions(null, false, "The --repository option is required.");
+            return new ParsedOptions(null, false, false, "The --input option is required for delete-components.");
         }
+
+        var finalConcurrency = customConcurrency ?? (command == CommandType.DeleteComponents ? 2 : 10);
 
         return new ParsedOptions(
             new CommandLineOptions
@@ -923,7 +1250,7 @@ internal sealed class CommandLineOptions
                 RepositoryFormat = string.IsNullOrWhiteSpace(repositoryFormat)
                     ? null
                     : repositoryFormat,
-                Concurrency = concurrency,
+                Concurrency = finalConcurrency,
                 OutputDirectory = string.IsNullOrWhiteSpace(outputDirectory)
                     ? Directory.GetCurrentDirectory()
                     : outputDirectory,
@@ -931,8 +1258,14 @@ internal sealed class CommandLineOptions
                 SortBy = sortBy,
                 SortOrder = sortOrder,
                 Limit = limit,
-                OutputPath = string.IsNullOrWhiteSpace(outputPath) ? null : outputPath
+                OutputPath = string.IsNullOrWhiteSpace(outputPath) ? null : outputPath,
+                InputPath = inputPath,
+                Force = force,
+                HtmlReport = htmlReport,
+                NamePattern = namePattern,
+                VersionPattern = versionPattern
             },
+            false,
             false,
             null
         );

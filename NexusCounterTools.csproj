@@ -7,9 +7,9 @@
     <Nullable>enable</Nullable>
     <IsPackable>true</IsPackable>
     <PackAsTool>true</PackAsTool>
-    <ToolCommandName>nexus-component-counter</ToolCommandName>
-    <PackageId>Nexus.ComponentCounter.Tool</PackageId>
-    <Version>1.0.0</Version>
+    <ToolCommandName>nexus-tool</ToolCommandName>
+    <PackageId>Nexus.Tool</PackageId>
+    <Version>1.0.7</Version>
     <Authors>Chatri Ngambenchawong</Authors>
     <Description>Counts components in Nexus repositories through the Nexus REST API.</Description>
   </PropertyGroup>
